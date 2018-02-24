@@ -43,6 +43,9 @@ class TestCall < Test::Unit::TestCase
     assert_equal(6, o.x)
     o&.x *= 7
     assert_equal(42, o.x)
+    assert_equal(42, o&.[:x])
+    o&.[:x] = 24
+    assert_equal(24, o&.["x"])
     o&.y = 5
     assert_equal(5, o.y)
     o&.z ||= 6
@@ -50,6 +53,9 @@ class TestCall < Test::Unit::TestCase
 
     o = nil
     assert_nil(o&.x)
+    assert_nil(o&.[:x])
+    o&.[:x] = 24
+    assert_nil(o&.["x"])
     assert_nothing_raised(NoMethodError) {o&.x = raise}
     assert_nothing_raised(NoMethodError) {o&.x *= raise}
     assert_nothing_raised(NoMethodError) {o&.x *= raise; nil}

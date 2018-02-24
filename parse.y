@@ -398,7 +398,7 @@ static NODE *dsym_node(struct parser_params*,NODE*,const YYLTYPE*);
 static NODE *gettable(struct parser_params*,ID,const YYLTYPE*);
 static NODE *assignable(struct parser_params*,ID,NODE*,const YYLTYPE*);
 
-static NODE *aryset(struct parser_params*,NODE*,NODE*,const YYLTYPE*);
+static NODE *aryset(struct parser_params*,NODE*,ID,NODE*,const YYLTYPE*);
 static NODE *attrset(struct parser_params*,NODE*,ID,ID,const YYLTYPE*);
 
 static void rb_backref_error(struct parser_params*,NODE*);
@@ -833,7 +833,7 @@ static void token_info_pop(struct parser_params*, const char *token, const rb_co
 %type <node> mlhs mlhs_head mlhs_basic mlhs_item mlhs_node mlhs_post mlhs_inner
 %type <id>   fsym keyword_variable user_variable sym symbol operation operation2 operation3
 %type <id>   cname fname op f_rest_arg f_block_arg opt_f_block_arg f_norm_arg f_bad_arg
-%type <id>   f_kwrest f_label f_arg_asgn call_op call_op2 reswords relop dot_or_colon
+%type <id>   f_kwrest f_label f_arg_asgn call_op call_op2 reswords relop dot_or_colon lbracket
 %token END_OF_INPUT 0	"end-of-input"
 %token <id> '.'
 %token <id> '\\'	"backslash"
@@ -1197,14 +1197,14 @@ command_asgn	: lhs '=' command_rhs
 		    /*% %*/
 		    /*% ripper: opassign!($1, $2, $3) %*/
 		    }
-		| primary_value '[' opt_call_args rbracket tOP_ASGN command_rhs
+		| primary_value lbracket opt_call_args rbracket tOP_ASGN command_rhs
 		    {
+			if (CALL_Q_P($2)) yyerror1(&@2, "&. is not supported yet");
 		    /*%%%*/
 			value_expr($6);
 			$$ = new_ary_op_assign(p, $1, $3, $5, $6, &@3, &@$);
 		    /*% %*/
-		    /*% ripper: opassign!(aref_field!($1, escape_Qundef($3)), $5, $6) %*/
-
+		    /*% ripper: opassign!(aref_field!($1, $2, escape_Qundef($3)), $5, $6) %*/
 		    }
 		| primary_value call_op tIDENTIFIER tOP_ASGN command_rhs
 		    {
@@ -1567,12 +1567,12 @@ mlhs_node	: user_variable
 		    /*% %*/
 		    /*% ripper: assignable(p, var_field(p, $1)) %*/
 		    }
-		| primary_value '[' opt_call_args rbracket
+		| primary_value lbracket opt_call_args rbracket
 		    {
 		    /*%%%*/
-			$$ = aryset(p, $1, $3, &@$);
+			$$ = aryset(p, $1, $2, $3, &@$);
 		    /*% %*/
-		    /*% ripper: aref_field!($1, escape_Qundef($3)) %*/
+		    /*% ripper: aref_field!($1, $2, escape_Qundef($3)) %*/
 		    }
 		| primary_value call_op tIDENTIFIER
 		    {
@@ -1633,12 +1633,12 @@ lhs		: user_variable
 		    /*% %*/
 		    /*% ripper: assignable(p, var_field(p, $1)) %*/
 		    }
-		| primary_value '[' opt_call_args rbracket
+		| primary_value lbracket opt_call_args rbracket
 		    {
 		    /*%%%*/
-			$$ = aryset(p, $1, $3, &@$);
+			$$ = aryset(p, $1, $2, $3, &@$);
 		    /*% %*/
-		    /*% ripper: aref_field!($1, escape_Qundef($3)) %*/
+		    /*% ripper: aref_field!($1, $2, escape_Qundef($3)) %*/
 		    }
 		| primary_value call_op tIDENTIFIER
 		    {
@@ -1824,13 +1824,14 @@ arg		: lhs '=' arg_rhs
 		    /*% %*/
 		    /*% ripper: opassign!($1, $2, $3) %*/
 		    }
-		| primary_value '[' opt_call_args rbracket tOP_ASGN arg_rhs
+		| primary_value lbracket opt_call_args rbracket tOP_ASGN arg_rhs
 		    {
+			if (CALL_Q_P($2)) yyerror1(&@2, "&. is not supported yet");
 		    /*%%%*/
 			value_expr($6);
 			$$ = new_ary_op_assign(p, $1, $3, $5, $6, &@3, &@$);
 		    /*% %*/
-		    /*% ripper: opassign!(aref_field!($1, escape_Qundef($3)), $5, $6) %*/
+		    /*% ripper: opassign!(aref_field!($1, $2, escape_Qundef($3)), $5, $6) %*/
 		    }
 		| primary_value call_op tIDENTIFIER tOP_ASGN arg_rhs
 		    {
@@ -3175,16 +3176,16 @@ method_call	: fcall paren_args
 		    /*% %*/
 		    /*% ripper: zsuper! %*/
 		    }
-		| primary_value '[' opt_call_args rbracket
+		| primary_value lbracket opt_call_args rbracket
 		    {
 		    /*%%%*/
-			if ($1 && nd_type($1) == NODE_SELF)
+			if (!CALL_Q_P($2) && $1 && nd_type($1) == NODE_SELF)
 			    $$ = NEW_FCALL(tAREF, $3, &@$);
 			else
-			    $$ = NEW_CALL($1, tAREF, $3, &@$);
+			    $$ = NEW_QCALL($2, $1, tAREF, $3, &@$);
 			fixpos($$, $1);
 		    /*% %*/
-		    /*% ripper: aref!($1, escape_Qundef($3)) %*/
+		    /*% ripper: aref!($1, $2, escape_Qundef($3)) %*/
 		    }
 		;
 
@@ -4304,6 +4305,10 @@ opt_nl		: /* none */
 		;
 
 rparen		: opt_nl ')'
+		;
+
+lbracket	: '[' {$$ = 0;}
+		| call_op '[' {$$ = $1;}
 		;
 
 rbracket	: opt_nl ']'
@@ -9132,9 +9137,9 @@ new_bv(struct parser_params *p, ID name)
 
 #ifndef RIPPER
 static NODE *
-aryset(struct parser_params *p, NODE *recv, NODE *idx, const YYLTYPE *loc)
+aryset(struct parser_params *p, NODE *recv, ID atype, NODE *idx, const YYLTYPE *loc)
 {
-    return NEW_ATTRASGN(recv, tASET, idx, loc);
+    return NEW_ATTRASGN(recv, CALL_Q_P(atype) ? tAREF : tASET, idx, loc);
 }
 
 static void
