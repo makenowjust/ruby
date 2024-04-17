@@ -57,7 +57,7 @@ jobs:
           - ruby-3.3
 
     steps:
-      - uses: ruby/setup-ruby@5daca165445f0ae10478593083f72ca2625e241d # v1.169.0
+      - uses: ruby/setup-ruby@6bd3d993c602f6b675728ebaecb2b569ff86e99b # v1.174.0
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler: none
