@@ -96,7 +96,7 @@ jobs:
             ${{ steps.find-tools.outputs.needs }}
         if: ${{ steps.find-tools.outputs.needs != '' }}
 
-      - uses: ruby/setup-ruby@5daca165445f0ae10478593083f72ca2625e241d # v1.169.0
+      - uses: ruby/setup-ruby@1198b074305f9356bd56dd4b311757cc0dab2f1c # v1.175.1
         with:
           ruby-version: '2.7'
           bundler: none
