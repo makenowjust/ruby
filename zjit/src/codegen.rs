@@ -681,6 +681,8 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::StringConcat { strings, state } => gen_string_concat(jit, asm, function, opnds!(strings), &function.frame_state(*state)),
         &Insn::StringGetbyte { string, index } => gen_string_getbyte(asm, opnd!(string), opnd!(index)),
         Insn::StringSetbyteFixnum { string, index, value } => gen_string_setbyte_fixnum(asm, opnd!(string), opnd!(index), opnd!(value)),
+        &Insn::IOBufferLoad { ptr, num_bits, signed } => gen_io_buffer_load(asm, opnd!(ptr), num_bits, signed),
+        &Insn::IOBufferStore { ptr, value, num_bits } => no_output!(gen_io_buffer_store(asm, opnd!(ptr), opnd!(value), num_bits)),
         Insn::StringAppend { recv, other, state } => gen_string_append(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringAppendCodepoint { recv, other, state } => gen_string_append_codepoint(jit, asm, function, opnd!(recv), opnd!(other), &function.frame_state(*state)),
         Insn::StringEqual { left, right } => gen_string_equal(asm, opnd!(left), opnd!(right)),
@@ -736,6 +738,7 @@ fn gen_insn(cb: &mut CodeBlock, jit: &mut JITState, asm: &mut Assembler, functio
         Insn::FixnumXor { left, right } => gen_fixnum_xor(asm, opnd!(left), opnd!(right)),
         Insn::IntAnd { left, right } => asm.and(opnd!(left), opnd!(right)),
         Insn::IntOr { left, right } => gen_int_or(asm, opnd!(left), opnd!(right)),
+        Insn::IntAdd { left, right } => asm.add(opnd!(left), opnd!(right)),
         &Insn::FixnumLShift { left, right, state } => {
             // We only create FixnumLShift when we know the shift amount statically and it's in [0,
             // 63].
@@ -4222,6 +4225,28 @@ fn gen_string_getbyte(asm: &mut Assembler, string: Opnd, index: Opnd) -> Opnd {
 fn gen_string_setbyte_fixnum(asm: &mut Assembler, string: Opnd, index: Opnd, value: Opnd) -> Opnd {
     // rb_str_setbyte is not leaf, but we guard types and index ranges in HIR
     asm_ccall!(asm, rb_str_setbyte, string, index, value)
+}
+
+fn gen_io_buffer_load(asm: &mut Assembler, ptr: Opnd, num_bits: u8, signed: bool) -> Opnd {
+    let ptr = asm.load_mem(ptr);
+    let val = asm.load(Opnd::mem(num_bits, ptr, 0));
+    let val = val.with_num_bits(64);
+    if num_bits == 64 {
+        val
+    } else if signed {
+        // Sign-extend by shifting the loaded bits to the top and back down.
+        let shift = Opnd::UImm(64 - num_bits as u64);
+        let val = asm.lshift(val, shift);
+        asm.rshift(val, shift)
+    } else {
+        asm.and(val, Opnd::UImm((1u64 << num_bits) - 1))
+    }
+}
+
+fn gen_io_buffer_store(asm: &mut Assembler, ptr: Opnd, value: Opnd, num_bits: u8) {
+    let ptr = asm.load_mem(ptr);
+    let value = asm.load_mem(value);
+    asm.store(Opnd::mem(num_bits, ptr, 0), value);
 }
 
 fn gen_string_append(jit: &mut JITState, asm: &mut Assembler, function: &Function, string: Opnd, val: Opnd, state: &FrameState) -> Opnd {

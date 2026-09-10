@@ -222,6 +222,8 @@ pub fn init() -> Annotations {
     annotate!(rb_cString, "length", types::Fixnum, no_gc, leaf, elidable);
     annotate!(rb_cString, "getbyte", inline_string_getbyte);
     annotate!(rb_cString, "setbyte", inline_string_setbyte);
+    annotate!(rb_cIOBuffer, "get_value", inline_io_buffer_get_value);
+    annotate!(rb_cIOBuffer, "set_value", inline_io_buffer_set_value);
     annotate!(rb_cString, "empty?", inline_string_empty_p, types::BoolExact, no_gc, leaf, elidable);
     annotate!(rb_cString, "<<", inline_string_append);
     annotate!(rb_cString, "==", inline_string_eq);
@@ -484,6 +486,126 @@ fn inline_string_bytesize(fun: &mut hir::Function, block: hir::BlockId, recv: hi
         return Some(result);
     }
     None
+}
+
+/// RB_IO_BUFFER_READONLY in include/ruby/io/buffer.h.
+const RB_IO_BUFFER_READONLY: u64 = 128;
+
+/// The IO::Buffer data types the get_value/set_value inlining supports: the
+/// byte-sized and little-endian integer types, as (num_bits, signed).
+/// Big-endian, float and 128-bit types take the generic cfunc path.
+fn io_buffer_data_type(sym: VALUE) -> Option<(u8, bool)> {
+    let candidates: [(&str, u8, bool); 8] = [
+        ("U8", 8, false),
+        ("S8", 8, true),
+        ("u16", 16, false),
+        ("s16", 16, true),
+        ("u32", 32, false),
+        ("s32", 32, true),
+        ("u64", 64, false),
+        ("s64", 64, true),
+    ];
+    for (name, num_bits, signed) in candidates {
+        let candidate = unsafe { rb_id2sym(rb_intern2(name.as_ptr().cast(), name.len() as _)) };
+        if sym == candidate {
+            return Some((num_bits, signed));
+        }
+    }
+    None
+}
+
+/// Emit the guards shared by the get_value and set_value inlining and return
+/// (unboxed offset, machine address of the access).
+///
+/// The receiver's class is already guarded by the caller. The buffer must be
+/// an embedded TypedData (IO::Buffer allocations are; bit 0 of the type field
+/// marks embedding), so every struct field sits at a constant offset from the
+/// receiver. It must not be a slice (source is nil), so it cannot be
+/// invalidated behind our back. A released buffer needs no separate base
+/// check: releasing zeroes the size, so the bounds guard catches it. Each
+/// guard side-exits into the C path, which raises the errors.
+fn io_buffer_guard_to_addr(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, offset: hir::InsnId, num_bits: u8, state: hir::InsnId) -> Option<(hir::InsnId, hir::InsnId)> {
+    use crate::hir::{Insn, Const, SideExitReason};
+    if !fun.likely_a(offset, types::Fixnum, state) { return None; }
+
+    let off_type = unsafe { rb_typeddata_offsetof_type() } as i32;
+    let off_data = unsafe { rb_typeddata_offsetof_data() } as i32;
+    let off_source = off_data + unsafe { rb_io_buffer_offsetof_source() } as i32;
+    let off_size = off_data + unsafe { rb_io_buffer_offsetof_size() } as i32;
+    let off_base = off_data + unsafe { rb_io_buffer_offsetof_base() } as i32;
+
+    let type_word = fun.load_field(block, recv, FieldName::typed_data_type, off_type, types::CInt64);
+    let one = fun.push_insn(block, Insn::Const { val: Const::CInt64(1) });
+    let embedded_bit = fun.push_insn(block, Insn::IntAnd { left: type_word, right: one });
+    fun.push_insn(block, Insn::GuardBitEquals { val: embedded_bit, expected: Const::CInt64(1), reason: Box::new(SideExitReason::IOBufferNotEmbedded), state, recompile: None });
+
+    let source = fun.load_field(block, recv, FieldName::io_buffer_source, off_source, types::BasicObject);
+    fun.push_insn(block, Insn::GuardBitEquals { val: source, expected: Const::Value(Qnil), reason: Box::new(SideExitReason::IOBufferHasSource), state, recompile: None });
+
+    let offset = fun.coerce_to(block, offset, types::Fixnum, state);
+    let offset = fun.push_insn(block, Insn::UnboxFixnum { val: offset });
+    let zero = fun.push_insn(block, Insn::Const { val: Const::CInt64(0) });
+    fun.push_insn(block, Insn::GuardGreaterEq { left: offset, right: zero, reason: Box::new(SideExitReason::GuardGreaterEq), state });
+    let bytes = fun.push_insn(block, Insn::Const { val: Const::CInt64((num_bits / 8) as i64) });
+    let end = fun.push_insn(block, Insn::IntAdd { left: offset, right: bytes });
+    let size = fun.load_field(block, recv, FieldName::io_buffer_size, off_size, types::CInt64);
+    fun.push_insn(block, Insn::GuardGreaterEq { left: size, right: end, reason: Box::new(SideExitReason::GuardGreaterEq), state });
+
+    let base = fun.load_field(block, recv, FieldName::io_buffer_base, off_base, types::CInt64);
+    let addr = fun.push_insn(block, Insn::IntAdd { left: base, right: offset });
+    Some((offset, addr))
+}
+
+fn inline_io_buffer_get_value(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    let &[buffer_type, offset] = args else { return None; };
+    // Only a compile-time constant type symbol is inlined; it selects the
+    // access width statically, so no runtime symbol dispatch remains.
+    let sym = fun.type_of(buffer_type).ruby_object()?;
+    if !sym.static_sym_p() { return None; }
+    let (num_bits, signed) = io_buffer_data_type(sym)?;
+
+    let (_, addr) = io_buffer_guard_to_addr(fun, block, recv, offset, num_bits, state)?;
+    let raw = fun.push_insn(block, hir::Insn::IOBufferLoad { ptr: addr, num_bits, signed });
+    // Only 64-bit loads can overflow a fixnum; those side-exit and allocate a
+    // bignum on the C path.
+    let result = fun.push_insn(block, hir::Insn::BoxFixnum { val: raw, state });
+    Some(result)
+}
+
+fn inline_io_buffer_set_value(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {
+    use crate::hir::{Insn, Const, SideExitReason};
+    let &[buffer_type, offset, value] = args else { return None; };
+    let sym = fun.type_of(buffer_type).ruby_object()?;
+    if !sym.static_sym_p() { return None; }
+    let (num_bits, signed) = io_buffer_data_type(sym)?;
+    if !fun.likely_a(value, types::Fixnum, state) { return None; }
+
+    let (offset, addr) = io_buffer_guard_to_addr(fun, block, recv, offset, num_bits, state)?;
+
+    let off_data = unsafe { rb_typeddata_offsetof_data() } as i32;
+    let off_flags = off_data + unsafe { rb_io_buffer_offsetof_flags() } as i32;
+    let flags = fun.load_field(block, recv, FieldName::io_buffer_flags, off_flags, types::CInt32);
+    fun.push_insn(block, Insn::GuardNoBitsSet { val: flags, mask: Const::CUInt64(RB_IO_BUFFER_READONLY), mask_name: None, reason: Box::new(SideExitReason::IOBufferReadonly), state });
+
+    let value = fun.coerce_to(block, value, types::Fixnum, state);
+    let value = fun.push_insn(block, Insn::UnboxFixnum { val: value });
+    if num_bits < 64 {
+        // The C path converts through NUM2INT/NUM2UINT, whose domain is
+        // [INT_MIN, INT_MAX] / [INT_MIN, UINT_MAX], and then truncates to the
+        // data type's width; out-of-domain values raise RangeError there.
+        let min = fun.push_insn(block, Insn::Const { val: Const::CInt64(i32::MIN as i64) });
+        fun.push_insn(block, Insn::GuardGreaterEq { left: value, right: min, reason: Box::new(SideExitReason::GuardGreaterEq), state });
+        let too_big: i64 = if signed { i32::MAX as i64 + 1 } else { u32::MAX as i64 + 1 };
+        let too_big = fun.push_insn(block, Insn::Const { val: Const::CInt64(too_big) });
+        fun.push_insn(block, Insn::GuardLess { left: value, right: too_big, reason: Box::new(SideExitReason::GuardLess), state });
+    }
+    fun.push_insn(block, Insn::IOBufferStore { ptr: addr, value, num_bits });
+
+    // The C path returns the offset advanced past the written value.
+    let bytes = fun.push_insn(block, Insn::Const { val: Const::CInt64((num_bits / 8) as i64) });
+    let end = fun.push_insn(block, Insn::IntAdd { left: offset, right: bytes });
+    let result = fun.push_insn(block, Insn::BoxFixnum { val: end, state });
+    Some(result)
 }
 
 fn inline_string_getbyte(fun: &mut hir::Function, block: hir::BlockId, recv: hir::InsnId, args: &[hir::InsnId], state: hir::InsnId) -> Option<hir::InsnId> {

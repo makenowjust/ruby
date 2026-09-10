@@ -646,6 +646,9 @@ pub enum SideExitReason {
     GuardNotShared,
     GuardLess,
     GuardGreaterEq,
+    IOBufferNotEmbedded,
+    IOBufferHasSource,
+    IOBufferReadonly,
     GuardSuperMethodEntry,
     PatchPoint(Invariant),
     CalleeSideExit,
@@ -921,6 +924,11 @@ pub enum FieldName {
     fields_obj,
     thread_ptr,
     len,
+    typed_data_type,
+    io_buffer_base,
+    io_buffer_size,
+    io_buffer_flags,
+    io_buffer_source,
     SelfParam,
     Id(ID),
 }
@@ -1011,6 +1019,12 @@ pub enum Insn {
     /// Call rb_str_getbyte with known-Fixnum index
     StringGetbyte { string: InsnId, index: InsnId },
     StringSetbyteFixnum { string: InsnId, index: InsnId, value: InsnId },
+    /// Load num_bits bits from the machine address ptr, zero- or sign-extended
+    /// to a CInt64. Bounds and validity are guarded where the load is emitted;
+    /// see IO::Buffer#get_value inlining in cruby_methods.rs.
+    IOBufferLoad { ptr: InsnId, num_bits: u8, signed: bool },
+    /// Store the low num_bits bits of value to the machine address ptr.
+    IOBufferStore { ptr: InsnId, value: InsnId, num_bits: u8 },
     StringAppend { recv: InsnId, other: InsnId, state: InsnId },
     StringAppendCodepoint { recv: InsnId, other: InsnId, state: InsnId },
     StringEqual { left: InsnId, right: InsnId },
@@ -1290,6 +1304,7 @@ pub enum Insn {
     FixnumXor  { left: InsnId, right: InsnId },
     IntAnd     { left: InsnId, right: InsnId },
     IntOr      { left: InsnId, right: InsnId },
+    IntAdd     { left: InsnId, right: InsnId },
     FixnumLShift { left: InsnId, right: InsnId, state: InsnId },
     FixnumRShift { left: InsnId, right: InsnId },
 
@@ -1435,6 +1450,13 @@ macro_rules! for_each_operand_impl {
                 $visit_one!(*index);
                 $visit_one!(*value);
             }
+            Insn::IOBufferLoad { ptr, .. } => {
+                $visit_one!(*ptr);
+            }
+            Insn::IOBufferStore { ptr, value, .. } => {
+                $visit_one!(*ptr);
+                $visit_one!(*value);
+            }
             Insn::StringAppend { recv, other, state }
             | Insn::StringAppendCodepoint { recv, other, state } => {
                 $visit_one!(*recv);
@@ -1519,6 +1541,7 @@ macro_rules! for_each_operand_impl {
             | Insn::FixnumXor { left, right }
             | Insn::IntAnd { left, right }
             | Insn::IntOr { left, right }
+            | Insn::IntAdd { left, right }
             | Insn::FixnumRShift { left, right }
             | Insn::IsBitEqual { left, right }
             | Insn::IsBitNotEqual { left, right } => {
@@ -1695,7 +1718,7 @@ impl Insn {
             | Insn::SetLocal { .. } | Insn::Throw { .. } | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. }
-            | Insn::ArrayAset { .. }
+            | Insn::ArrayAset { .. } | Insn::IOBufferStore { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } => false,
             _ => true,
         }
@@ -1757,6 +1780,8 @@ impl Insn {
             Insn::StringConcat { .. } => effects::Any,
             Insn::StringGetbyte { .. } => Effect::read_write(abstract_heaps::Other, abstract_heaps::Empty),
             Insn::StringSetbyteFixnum { .. } => effects::Any,
+            Insn::IOBufferLoad { .. } => Effect::read_write(abstract_heaps::Memory, abstract_heaps::Empty),
+            Insn::IOBufferStore { .. } => effects::Any,
             Insn::StringAppend { .. } => effects::Any,
             Insn::StringAppendCodepoint { .. } => effects::Any,
             Insn::StringEqual { .. } => Effect::write(abstract_heaps::Allocator),
@@ -1911,6 +1936,7 @@ impl Insn {
             Insn::FixnumXor { .. } => effects::Empty,
             Insn::IntAnd { .. } => effects::Empty,
             Insn::IntOr { .. } => effects::Empty,
+            Insn::IntAdd { .. } => effects::Empty,
             Insn::FixnumLShift { .. } => effects::Empty,
             Insn::FixnumRShift { .. } => effects::Empty,
             Insn::AnyToString { .. } => effects::Any,
@@ -2148,6 +2174,12 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
                 write_separated!(f, " ", ", ", strings);
                 Ok(())
             }
+            Insn::IOBufferLoad { ptr, num_bits, signed } => {
+                write!(f, "IOBufferLoad {ptr}, num_bits={num_bits}, signed={signed}")
+            }
+            Insn::IOBufferStore { ptr, value, num_bits } => {
+                write!(f, "IOBufferStore {ptr}, {value}, num_bits={num_bits}")
+            }
             Insn::StringGetbyte { string, index, .. } => {
                 write!(f, "StringGetbyte {string}, {index}")
             }
@@ -2303,6 +2335,7 @@ impl<'a> std::fmt::Display for InsnPrinter<'a> {
             Insn::FixnumXor  { left, right, .. } => { write!(f, "FixnumXor {left}, {right}") },
             Insn::IntAnd     { left, right } => { write!(f, "IntAnd {left}, {right}") },
             Insn::IntOr      { left, right } => { write!(f, "IntOr {left}, {right}") },
+            Insn::IntAdd     { left, right } => { write!(f, "IntAdd {left}, {right}") },
             Insn::FixnumLShift { left, right, .. } => { write!(f, "FixnumLShift {left}, {right}") },
             Insn::FixnumRShift { left, right, .. } => { write!(f, "FixnumRShift {left}, {right}") },
             Insn::GuardType { val, guard_type, recompile, .. } => {
@@ -3596,6 +3629,7 @@ impl Function {
             | Insn::IncrCounter(_) | Insn::IncrCounterPtr { .. }
             | Insn::CheckInterrupts { .. } | Insn::BreakPoint | Insn::Unreachable
             | Insn::StoreField { .. } | Insn::WriteBarrier { .. } | Insn::HashAset { .. } | Insn::ArrayAset { .. }
+            | Insn::IOBufferStore { .. }
             | Insn::PushInlineFrame { .. } | Insn::PopInlineFrame { .. } =>
                 panic!("Cannot infer type of instruction with no output: {}. See Insn::has_output().", self.insns[insn]),
             Insn::Const { val: Const::Value(val) } => Type::from_value(*val),
@@ -3630,6 +3664,7 @@ impl Function {
             Insn::StringConcat { .. } => types::StringExact,
             Insn::StringGetbyte { .. } => types::Fixnum,
             Insn::StringSetbyteFixnum { .. } => types::Fixnum,
+            Insn::IOBufferLoad { .. } => types::CInt64,
             Insn::StringAppend { .. } => types::StringExact,
             Insn::StringAppendCodepoint { .. } => types::StringExact,
             Insn::StringEqual { .. } => types::BoolExact,
@@ -3683,6 +3718,7 @@ impl Function {
             Insn::FixnumOr   { .. } => types::Fixnum,
             Insn::FixnumXor  { .. } => types::Fixnum,
             Insn::IntAnd { .. } => types::CInt64,
+            Insn::IntAdd { .. } => types::CInt64,
             Insn::IntOr { left, .. } => self.type_of(*left).unspecialized(),
             Insn::FixnumLShift { .. } => types::Fixnum,
             Insn::FixnumRShift { .. } => types::Fixnum,
@@ -7902,7 +7938,8 @@ impl Function {
                 }
             }
             Insn::IntAnd { left, right }
-            | Insn::IntOr { left, right } => {
+            | Insn::IntOr { left, right }
+            | Insn::IntAdd { left, right } => {
                 // TODO: Expand this to other matching C integer sizes when we need them.
                 let left_type = self.type_of(left);
                 if left_type.is_subtype(types::CInt64) {
@@ -8011,6 +8048,13 @@ impl Function {
             Insn::StringGetbyte { string, index } => {
                 self.assert_subtype(insn_id, string, types::String)?;
                 self.assert_subtype(insn_id, index, types::CInt64)
+            },
+            Insn::IOBufferLoad { ptr, .. } => {
+                self.assert_subtype(insn_id, ptr, types::CInt64)
+            },
+            Insn::IOBufferStore { ptr, value, .. } => {
+                self.assert_subtype(insn_id, ptr, types::CInt64)?;
+                self.assert_subtype(insn_id, value, types::CInt64)
             },
             Insn::StringSetbyteFixnum { string, index, value } => {
                 self.assert_subtype(insn_id, string, types::String)?;

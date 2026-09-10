@@ -350,9 +350,10 @@ get_io_buffer(VALUE self)
     return buffer;
 }
 
-// YJIT specializes IO::Buffer#get_value/#set_value (yjit/src/codegen.rs).
-// The generated code reads the private struct above directly, so its field
-// offsets are exposed here, next to the layout they describe.
+// YJIT (yjit/src/codegen.rs) and ZJIT (zjit/src/cruby_methods.rs) specialize
+// IO::Buffer#get_value/#set_value. The generated code reads the private
+// struct above directly, so its field offsets are exposed here, next to the
+// layout they describe.
 size_t
 rb_io_buffer_offsetof_base(void)
 {
