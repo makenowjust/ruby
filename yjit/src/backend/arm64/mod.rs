@@ -1028,6 +1028,7 @@ impl Assembler
                     match dest.rm_num_bits() {
                         64 | 32 => stur(cb, src.into(), dest.into()),
                         16 => sturh(cb, src.into(), dest.into()),
+                        8 => sturb(cb, src.into(), dest.into()),
                         num_bits => panic!("unexpected dest num_bits: {} (src: {:#?}, dest: {:#?})", num_bits, src, dest),
                     }
                 },
