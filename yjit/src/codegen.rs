@@ -6198,6 +6198,269 @@ fn jit_rb_str_setbyte(
     true
 }
 
+/// RB_IO_BUFFER_READONLY in include/ruby/io/buffer.h.
+const RB_IO_BUFFER_READONLY: u64 = 128;
+
+/// The IO::Buffer data types the get_value/set_value specialization supports:
+/// the byte-sized and little-endian integer types, as (bits, signed).
+/// Big-endian, 128-bit, and float types take the generic cfunc path.
+fn iobuf_data_type(sym: VALUE) -> Option<(u8, bool)> {
+    for &(name, bits, signed) in &[
+        ("U8", 8u8, false),
+        ("S8", 8, true),
+        ("u16", 16, false),
+        ("s16", 16, true),
+        ("u32", 32, false),
+        ("s32", 32, true),
+        ("u64", 64, false),
+        ("s64", 64, true),
+    ] {
+        if sym == rust_str_to_sym(name) {
+            return Some((bits, signed));
+        }
+    }
+    None
+}
+
+/// Load the receiver's rb_io_buffer struct pointer and guard that the buffer
+/// is not a slice (source is nil, so it cannot be invalidated behind our
+/// back). Everything else (including a released buffer's NULL base) is caught
+/// by the bounds check below, because base == NULL implies size == 0.
+///
+/// Only 3 registers are allocatable, so this and the helpers below are laid
+/// out to keep at most 3 values live at any point.
+fn jit_io_buffer_load(asm: &mut Assembler, recv_opnd: Opnd) -> Opnd {
+    let off_type = unsafe { rb_typeddata_offsetof_type() } as i32;
+    let off_data = unsafe { rb_typeddata_offsetof_data() } as i32;
+    let off_source = unsafe { rb_io_buffer_offsetof_source() } as i32;
+
+    let recv = asm.load(recv_opnd);
+    // An embedded TypedData stores the struct at the data field; bit 0 of the
+    // type field marks embedding. IO::Buffer allocations are embedded, so the
+    // non-embedded case just takes the C path.
+    asm.test(Opnd::mem(64, recv, off_type), Opnd::UImm(1));
+    asm.jz(Target::side_exit(Counter::iobuf_not_embedded));
+    let buffer = asm.lea(Opnd::mem(64, recv, off_data));
+
+    let source = asm.load(Opnd::mem(64, buffer, off_source));
+    asm.cmp(source, Qnil.into());
+    asm.jne(Target::side_exit(Counter::iobuf_invalid));
+
+    buffer
+}
+
+/// Untag the fixnum offset and guard 0 <= offset && offset + bytes <= size,
+/// side-exiting to the C path (which raises) otherwise.
+/// Returns the untagged offset.
+fn jit_io_buffer_bounds_check(asm: &mut Assembler, buffer: Opnd, offset_opnd: Opnd, bytes: u64) -> Opnd {
+    let off_size = unsafe { rb_io_buffer_offsetof_size() } as i32;
+
+    let offset = asm.rshift(offset_opnd, Opnd::UImm(1));
+    asm.cmp(offset, Opnd::UImm(0));
+    asm.jl(Target::side_exit(Counter::iobuf_out_of_bounds));
+
+    // offset + bytes > size is checked as offset > size - bytes so nothing
+    // stays live across the comparison. size < bytes makes the right side
+    // negative, which every non-negative offset correctly fails.
+    let size = asm.load(Opnd::mem(64, buffer, off_size));
+    let limit = asm.sub(size, Opnd::UImm(bytes));
+    asm.cmp(offset, limit);
+    asm.jg(Target::side_exit(Counter::iobuf_out_of_bounds));
+
+    offset
+}
+
+/// Compute base + offset. The base pointer is loaded here, at its only use,
+/// so the buffer struct pointer and the untagged offset die with this add.
+fn jit_io_buffer_addr(asm: &mut Assembler, buffer: Opnd, offset: Opnd) -> Opnd {
+    let off_base = unsafe { rb_io_buffer_offsetof_base() } as i32;
+    let base = asm.load(Opnd::mem(64, buffer, off_base));
+    asm.add(base, offset)
+}
+
+fn jit_rb_io_buffer_get_value(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    _ci: *const rb_callinfo,
+    _cme: *const rb_callable_method_entry_t,
+    _block: Option<BlockHandler>,
+    argc: i32,
+    known_recv_class: Option<VALUE>,
+) -> bool {
+    if argc != 2 {
+        return false;
+    }
+    if unsafe { known_recv_class != Some(rb_cIOBuffer) } {
+        return false;
+    }
+
+    let comptime_sym = jit.peek_at_stack(&asm.ctx, 1);
+    if !comptime_sym.static_sym_p() {
+        return false;
+    }
+    let Some((bits, signed)) = iobuf_data_type(comptime_sym) else {
+        return false;
+    };
+    let comptime_offset = jit.peek_at_stack(&asm.ctx, 0);
+    if !comptime_offset.fixnum_p() {
+        return false;
+    }
+
+    asm_comment!(asm, "IO::Buffer#get_value");
+
+    // The generated sequence keeps several values live at once; free the
+    // temp registers for them.
+    asm.spill_regs();
+
+    // Guard the data type symbol is the one this code was compiled for.
+    asm.cmp(asm.stack_opnd(1), comptime_sym.into());
+    asm.jne(Target::side_exit(Counter::iobuf_type_sym_mismatch));
+
+    let offset_opnd = asm.stack_opnd(0);
+    jit_guard_known_klass(
+        jit,
+        asm,
+        offset_opnd,
+        offset_opnd.into(),
+        comptime_offset,
+        SEND_MAX_DEPTH,
+        Counter::iobuf_offset_not_fixnum,
+    );
+
+    let buffer = jit_io_buffer_load(asm, asm.stack_opnd(2));
+    let offset = jit_io_buffer_bounds_check(asm, buffer, asm.stack_opnd(0), (bits / 8) as u64);
+    let addr = jit_io_buffer_addr(asm, buffer, offset);
+
+    let val = asm.load(Opnd::mem(bits, addr, 0));
+    let val = val.with_num_bits(64).unwrap();
+    let val = if bits == 64 {
+        val
+    } else if signed {
+        let shift = Opnd::UImm(64 - bits as u64);
+        let shifted = asm.lshift(val, shift);
+        asm.rshift(shifted, shift)
+    } else {
+        asm.and(val, Opnd::UImm((1u64 << bits) - 1))
+    };
+
+    let tagged = if bits == 64 {
+        // Only values below 2**62 in magnitude fit a fixnum; the rest take
+        // the C path and allocate a bignum.
+        let doubled = asm.add(val, val);
+        asm.jo(Target::side_exit(Counter::iobuf_fixnum_overflow));
+        asm.or(doubled, Opnd::UImm(1))
+    } else {
+        let doubled = asm.lshift(val, Opnd::UImm(1));
+        asm.or(doubled, Opnd::UImm(1))
+    };
+
+    asm.stack_pop(3);
+    let out = asm.stack_push(Type::Fixnum);
+    asm.mov(out, tagged);
+    true
+}
+
+fn jit_rb_io_buffer_set_value(
+    jit: &mut JITState,
+    asm: &mut Assembler,
+    _ci: *const rb_callinfo,
+    _cme: *const rb_callable_method_entry_t,
+    _block: Option<BlockHandler>,
+    argc: i32,
+    known_recv_class: Option<VALUE>,
+) -> bool {
+    if argc != 3 {
+        return false;
+    }
+    if unsafe { known_recv_class != Some(rb_cIOBuffer) } {
+        return false;
+    }
+
+    let comptime_sym = jit.peek_at_stack(&asm.ctx, 2);
+    if !comptime_sym.static_sym_p() {
+        return false;
+    }
+    let Some((bits, signed)) = iobuf_data_type(comptime_sym) else {
+        return false;
+    };
+    let comptime_offset = jit.peek_at_stack(&asm.ctx, 1);
+    if !comptime_offset.fixnum_p() {
+        return false;
+    }
+    let comptime_value = jit.peek_at_stack(&asm.ctx, 0);
+    if !comptime_value.fixnum_p() {
+        return false;
+    }
+
+    asm_comment!(asm, "IO::Buffer#set_value");
+
+    // The generated sequence keeps several values live at once; free the
+    // temp registers for them.
+    asm.spill_regs();
+
+    // Guard the data type symbol is the one this code was compiled for.
+    asm.cmp(asm.stack_opnd(2), comptime_sym.into());
+    asm.jne(Target::side_exit(Counter::iobuf_type_sym_mismatch));
+
+    let offset_opnd = asm.stack_opnd(1);
+    jit_guard_known_klass(
+        jit,
+        asm,
+        offset_opnd,
+        offset_opnd.into(),
+        comptime_offset,
+        SEND_MAX_DEPTH,
+        Counter::iobuf_offset_not_fixnum,
+    );
+    let value_opnd = asm.stack_opnd(0);
+    jit_guard_known_klass(
+        jit,
+        asm,
+        value_opnd,
+        value_opnd.into(),
+        comptime_value,
+        SEND_MAX_DEPTH,
+        Counter::iobuf_value_not_fixnum,
+    );
+
+    let buffer = jit_io_buffer_load(asm, asm.stack_opnd(3));
+
+    let off_flags = unsafe { rb_io_buffer_offsetof_flags() } as i32;
+    asm.test(Opnd::mem(32, buffer, off_flags), Opnd::UImm(RB_IO_BUFFER_READONLY));
+    asm.jnz(Target::side_exit(Counter::iobuf_readonly));
+
+    let bytes = (bits / 8) as u64;
+    let offset = jit_io_buffer_bounds_check(asm, buffer, asm.stack_opnd(1), bytes);
+    let addr = jit_io_buffer_addr(asm, buffer, offset);
+
+    let val = asm.rshift(asm.stack_opnd(0), Opnd::UImm(1));
+    if bits < 64 {
+        // The C path converts through NUM2INT/NUM2UINT, whose domain is
+        // [INT_MIN, INT_MAX] / [INT_MIN, UINT_MAX], and then truncates to the
+        // data type's width; out-of-domain values raise RangeError there.
+        let max: i64 = if signed { i32::MAX as i64 } else { u32::MAX as i64 };
+        asm.cmp(val, Opnd::Imm(i32::MIN as i64));
+        asm.jl(Target::side_exit(Counter::iobuf_value_out_of_range));
+        asm.cmp(val, Opnd::Imm(max));
+        asm.jg(Target::side_exit(Counter::iobuf_value_out_of_range));
+    }
+
+    asm.store(Opnd::mem(bits, addr, 0), val);
+
+    // The C path returns the offset advanced past the written value.
+    // The untagged offset died at the address computation; recompute it from
+    // the still-untouched stack operand.
+    let offset = asm.rshift(asm.stack_opnd(1), Opnd::UImm(1));
+    let end = asm.add(offset, Opnd::UImm(bytes));
+    let doubled = asm.lshift(end, Opnd::UImm(1));
+    let tagged = asm.or(doubled, Opnd::UImm(1));
+
+    asm.stack_pop(4);
+    let out = asm.stack_push(Type::Fixnum);
+    asm.mov(out, tagged);
+    true
+}
+
 // Codegen for rb_str_to_s()
 // When String#to_s is called on a String instance, the method returns self and
 // most of the overhead comes from setting up the method call. We observed that
@@ -11016,6 +11279,9 @@ pub fn yjit_reg_method_codegen_fns() {
         reg_method_codegen(rb_cArray, "<<", jit_rb_ary_push);
 
         reg_method_codegen(rb_cHash, "empty?", jit_rb_hash_empty_p);
+
+        reg_method_codegen(rb_cIOBuffer, "get_value", jit_rb_io_buffer_get_value);
+        reg_method_codegen(rb_cIOBuffer, "set_value", jit_rb_io_buffer_set_value);
 
         reg_method_codegen(rb_mKernel, "respond_to?", jit_obj_respond_to);
         reg_method_codegen(rb_mKernel, "block_given?", jit_rb_f_block_given_p);

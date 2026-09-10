@@ -530,6 +530,16 @@ make_counters! {
     getbyte_idx_negative,
     getbyte_idx_out_of_bounds,
 
+    iobuf_type_sym_mismatch,
+    iobuf_offset_not_fixnum,
+    iobuf_not_embedded,
+    iobuf_invalid,
+    iobuf_readonly,
+    iobuf_out_of_bounds,
+    iobuf_value_not_fixnum,
+    iobuf_value_out_of_range,
+    iobuf_fixnum_overflow,
+
     splatkw_not_hash,
     splatkw_not_nil,
 

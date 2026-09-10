@@ -153,6 +153,16 @@ extern "C" {
     pub fn rb_vm_ic_hit_p(ic: IC, reg_ep: *const VALUE) -> bool;
     pub fn rb_vm_stack_canary() -> VALUE;
     pub fn rb_vm_push_cfunc_frame(cme: *const rb_callable_method_entry_t, recv_idx: c_int);
+
+    // IO::Buffer#get_value/#set_value specialization (io_buffer.c exposes the
+    // private struct's field offsets; struct RTypedData is not in the bindings).
+    pub static mut rb_cIOBuffer: VALUE;
+    pub fn rb_io_buffer_offsetof_base() -> usize;
+    pub fn rb_io_buffer_offsetof_size() -> usize;
+    pub fn rb_io_buffer_offsetof_flags() -> usize;
+    pub fn rb_io_buffer_offsetof_source() -> usize;
+    pub fn rb_typeddata_offsetof_type() -> usize;
+    pub fn rb_typeddata_offsetof_data() -> usize;
 }
 
 // Renames

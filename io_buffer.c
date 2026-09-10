@@ -350,6 +350,45 @@ get_io_buffer(VALUE self)
     return buffer;
 }
 
+// YJIT specializes IO::Buffer#get_value/#set_value (yjit/src/codegen.rs).
+// The generated code reads the private struct above directly, so its field
+// offsets are exposed here, next to the layout they describe.
+size_t
+rb_io_buffer_offsetof_base(void)
+{
+    return offsetof(struct rb_io_buffer, base);
+}
+
+size_t
+rb_io_buffer_offsetof_size(void)
+{
+    return offsetof(struct rb_io_buffer, size);
+}
+
+size_t
+rb_io_buffer_offsetof_flags(void)
+{
+    return offsetof(struct rb_io_buffer, flags);
+}
+
+size_t
+rb_io_buffer_offsetof_source(void)
+{
+    return offsetof(struct rb_io_buffer, source);
+}
+
+size_t
+rb_typeddata_offsetof_type(void)
+{
+    return offsetof(struct RTypedData, type);
+}
+
+size_t
+rb_typeddata_offsetof_data(void)
+{
+    return offsetof(struct RTypedData, data);
+}
+
 static bool
 io_buffer_slice_p(struct rb_io_buffer *buffer)
 {
